@@ -17,6 +17,18 @@ def contains_forbidden_link(text: str) -> bool:
             return True
     return False
 
+
+def contains_credential_keywords(text: str) -> bool:
+    KEYWORDS = [
+        "otp", "password", "passcode", "one time",
+        "verification code", "pin"
+    ]
+    t = text.lower()
+    return any(k in t for k in KEYWORDS)
+
+
+
+
 def basic_rule_score(text: str) -> int:
     score = 0
     if re.search(r"\b\d{10}\b", text):

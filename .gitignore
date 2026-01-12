@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models / artifacts
+models/
+*.joblib
+*.bin
+*.safetensors
+
+# Data
+dataset/
+*.jsonl
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Redis / runtime
+*.rdb

@@ -1,10 +1,6 @@
 # qlora_train_cpu.py
 # Windows-safe CPU-first LoRA training script
-# - No bitsandbytes
-# - Uses Accelerate + PEFT
-# - Intended for small datasets / smoke runs on CPU
 
-import os
 import argparse
 from pathlib import Path
 import logging
@@ -30,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="CPU-safe LoRA fine-tuning (Accelerate + PEFT)")
+    p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--output_dir", type=str, default="qlora_out")
@@ -45,49 +41,42 @@ def parse_args():
     p.add_argument("--target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj")
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--eval_steps", type=int, default=200)
-    p.add_argument("--save_steps", type=int, default=500)
     return p.parse_args()
 
 
-def chunk_texts_to_inputs(tokenizer, texts: List[str], max_length: int, stride: int):
-    tokenized_chunks = {"input_ids": [], "attention_mask": []}
-    for t in texts:
-        tok = tokenizer(t, return_attention_mask=True, add_special_tokens=True)
-        ids = tok["input_ids"]
-        att = tok["attention_mask"]
-        if len(ids) <= max_length:
-            tokenized_chunks["input_ids"].append(ids)
-            tokenized_chunks["attention_mask"].append(att)
+def chunk_texts(tokenizer, texts: List[str], max_len: int, stride: int):
+    input_ids, attention_masks = [], []
+
+    for text in texts:
+        tokens = tokenizer(text, add_special_tokens=True)
+        ids = tokens["input_ids"]
+
+        if len(ids) <= max_len:
+            input_ids.append(ids)
+            attention_masks.append([1] * len(ids))
             continue
+
         start = 0
         while start < len(ids):
-            end = start + max_length
+            end = start + max_len
             chunk = ids[start:end]
-            chunk_att = att[start:end]
-            tokenized_chunks["input_ids"].append(chunk)
-            tokenized_chunks["attention_mask"].append(chunk_att)
+            input_ids.append(chunk)
+            attention_masks.append([1] * len(chunk))
             if end >= len(ids):
                 break
             start = end - stride
 
-    def pad_to_max(ids, att):
-        pad_len = max_length - len(ids)
-        return ids + [tokenizer.pad_token_id] * pad_len, att + [0] * pad_len
+    def pad(x):
+        return x + [tokenizer.pad_token_id] * (max_len - len(x))
 
-    padded_input_ids = []
-    padded_att = []
-    for ids, att in zip(tokenized_chunks["input_ids"], tokenized_chunks["attention_mask"]):
-        if len(ids) < max_length:
-            ids, att = pad_to_max(ids, att)
-        else:
-            ids = ids[:max_length]
-            att = att[:max_length]
-        padded_input_ids.append(ids)
-        padded_att.append(att)
+    input_ids = [pad(x[:max_len]) for x in input_ids]
+    attention_masks = [pad(x[:max_len]) for x in attention_masks]
 
-    ds = Dataset.from_dict({"input_ids": padded_input_ids, "attention_mask": padded_att})
-    return ds
+    return Dataset.from_dict({
+        "input_ids": input_ids,
+        "attention_mask": attention_masks,
+        "labels": input_ids.copy()
+    })
 
 
 def main():
@@ -95,147 +84,88 @@ def main():
     torch.manual_seed(args.seed)
 
     accelerator = Accelerator()
-    is_main_process = accelerator.is_main_process
-
     output_dir = Path(args.output_dir)
-    if is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading tokenizer and model (CPU mode)")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    logger.info("Loading tokenizer")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
-    # Load model in CPU float32 mode
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map={"": "cpu"})
-    # prepare model for PEFT LoRA
-    target_modules = [m.strip() for m in args.target_modules.split(',') if m.strip()]
+    logger.info("Loading model (CPU)")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.float32,
+        device_map={"": "cpu"}
+    )
+
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=target_modules,
         lora_dropout=args.lora_dropout,
+        target_modules=args.target_modules.split(","),
         bias="none",
-        task_type="CAUSAL_LM",
+        task_type="CAUSAL_LM"
     )
     model = get_peft_model(model, lora_config)
-
     model.train()
 
     logger.info("Loading dataset")
-    if args.dataset.endswith('.json') or args.dataset.endswith('.jsonl'):
-        raw = load_dataset('json', data_files=args.dataset)
-        key = list(raw.keys())[0]
-        raw = raw[key]
-    else:
-        raw = load_dataset('text', data_files=args.dataset')['train']
-        raw = raw.map(lambda x: {"text": x['text']})
+    raw_ds = load_dataset("json", data_files=args.dataset)["train"]
 
-    texts = []
-    for ex in raw:
-        if isinstance(ex, dict):
-            txt = ex.get('text') or ex.get('content') or ''
-        else:
-            txt = str(ex)
-        texts.append(txt)
+    texts = [x["text"] for x in raw_ds if x.get("text")]
 
-    logger.info(f"Preparing {len(texts)} raw examples into chunks")
-    chunked_ds = chunk_texts_to_inputs(tokenizer, texts, max_length=args.max_seq_len, stride=args.chunk_stride)
+    logger.info("Chunking dataset")
+    dataset = chunk_texts(tokenizer, texts, args.max_seq_len, args.chunk_stride)
+    split = dataset.train_test_split(test_size=0.05)
 
-    def add_labels(batch):
-        batch['labels'] = batch['input_ids'].copy()
-        return batch
+    train_loader = DataLoader(
+        split["train"],
+        batch_size=args.per_device_batch_size,
+        shuffle=True,
+        collate_fn=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    )
 
-    chunked_ds = chunked_ds.map(add_labels, batched=False)
+    eval_loader = DataLoader(
+        split["test"],
+        batch_size=args.per_device_batch_size,
+        collate_fn=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    )
 
-    train_test = chunked_ds.train_test_split(test_size=0.05)
-    train_ds = train_test['train']
-    eval_ds = train_test['test']
+    optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    logger.info(f"Train chunks: {len(train_ds)} Eval chunks: {len(eval_ds)}")
+    total_steps = math.ceil(len(train_loader) / args.gradient_accumulation_steps) * args.epochs
+    scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=50,
+        num_training_steps=total_steps
+    )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    model, optimizer, train_loader, eval_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, eval_loader, scheduler
+    )
 
-    train_dataloader = DataLoader(train_ds, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_batch_size)
-    eval_dataloader = DataLoader(eval_ds, collate_fn=data_collator, batch_size=args.per_device_batch_size)
-
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-
-    total_train_steps = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) * args.epochs
-    lr_scheduler = get_scheduler(name='linear', optimizer=optimizer, num_warmup_steps=100, num_training_steps=total_train_steps)
-
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, lr_scheduler)
-
-    if is_main_process:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"Total params {total_params:,} Trainable params {trainable:,}")
-
-    global_step = 0
-    best_eval_loss = float('inf')
-
+    logger.info("Starting training")
     for epoch in range(args.epochs):
-        model.train()
         total_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(train_loader):
             outputs = model(**batch)
             loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
             total_loss += loss.item()
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+        logger.info(f"Epoch {epoch} loss: {total_loss / len(train_loader):.4f}")
 
-                if global_step % args.eval_steps == 0:
-                    model.eval()
-                    eval_loss = 0.0
-                    eval_steps = 0
-                    with torch.no_grad():
-                        for ebatch in eval_dataloader:
-                            out = model(**ebatch)
-                            eval_loss += out.loss.item()
-                            eval_steps += 1
-                    eval_loss = eval_loss / max(1, eval_steps)
-                    logger.info(f"Epoch {epoch} Step {global_step} Eval loss {eval_loss:.4f}")
-                    model.train()
+    logger.info("Saving LoRA adapter")
+    model.save_pretrained(output_dir / "lora_adapter")
+    tokenizer.save_pretrained(output_dir / "lora_adapter")
 
-                    if eval_loss < best_eval_loss and is_main_process:
-                        best_eval_loss = eval_loss
-                        save_dir = output_dir / f"best_step_{global_step}"
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        accelerator.wait_for_everyone()
-                        unwrapped = accelerator.unwrap_model(model)
-                        unwrapped.save_pretrained(save_dir, save_function=accelerator.save)
-                        tokenizer.save_pretrained(save_dir)
-                        logger.info(f"Saved best adapter at step {global_step} to {save_dir}")
-
-                if global_step % args.save_steps == 0 and is_main_process:
-                    save_dir = output_dir / f"checkpoint_{global_step}"
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    accelerator.wait_for_everyone()
-                    unwrapped = accelerator.unwrap_model(model)
-                    unwrapped.save_pretrained(save_dir, save_function=accelerator.save)
-                    tokenizer.save_pretrained(save_dir)
-                    logger.info(f"Saved checkpoint at step {global_step} to {save_dir}")
-
-        avg_loss = total_loss / (step + 1)
-        logger.info(f"Epoch {epoch} finished. Avg training loss {avg_loss:.4f}")
-
-    if is_main_process:
-        final_dir = output_dir / 'lora_adapter'
-        final_dir.mkdir(parents=True, exist_ok=True)
-        accelerator.wait_for_everyone()
-        unwrapped = accelerator.unwrap_model(model)
-        unwrapped.save_pretrained(final_dir, save_function=accelerator.save)
-        tokenizer.save_pretrained(final_dir)
-        logger.info(f"Saved final adapter to {final_dir}")
-
-    logger.info("Done")
+    logger.info("Training complete")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
