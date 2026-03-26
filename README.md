@@ -89,3 +89,8 @@ flowchart LR
   - imports in [`inference_server/app.py`](C:\Users\91965\cars24\github-readme-batch\SayzoGuard\inference_server\app.py) assume a `sayzoguard` package path that is not reflected by the checked-in folder structure
   - escrow state and session history are stored only in memory, so they will reset on restart
   - there is no measured benchmark or labeled evaluation report in the repo yet
+
+## Supporting Docs
+- [Architecture diagram](docs/architecture.png)
+- [Evaluation logs and outputs](docs/evaluation.md)
+- [Sample inputs and outputs](docs/sample_io.md)
