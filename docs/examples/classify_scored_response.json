@@ -1,0 +1,9 @@
+{
+  "blocked": true,
+  "rule_score": 3,
+  "llm_result": {
+    "leakage": true,
+    "confidence": 0.88,
+    "reason": "Restricted link present"
+  }
+}
